@@ -22,8 +22,10 @@
 #include <errno.h>
 #include <assert.h>
 #include <dlfcn.h>
+#include <stdio.h>
 #include <sys/types.h>
 #include <sys/stat.h>
+#include <time.h>
 #include <unistd.h>
 #include "param.h"
 
@@ -1704,6 +1706,9 @@ fail:
 }
 
 static ncclResult_t ncclCommInitRankDev(ncclComm_t* newcomm, int nranks, ncclUniqueId commId, int myrank, int cudaDev, ncclConfig_t *config) {
+  ncclResult_t ret;
+  clock_t start, bootstrap, nccl_init, nccl_calloc, nccl_async_launch, done;
+  start = clock();
   ncclResult_t res = ncclSuccess;
   ncclComm_t comm = NULL;
   struct ncclCommInitRankAsyncJob *job = NULL;
@@ -1712,9 +1717,11 @@ static ncclResult_t ncclCommInitRankDev(ncclComm_t* newcomm, int nranks, ncclUni
     INFO(NCCL_ENV, "NCCL_COMM_ID set by environment to %s", env);
     NCCLCHECKGOTO(bootstrapCreateRoot((struct ncclBootstrapHandle*)&commId, true), res, fail);
   }
+  bootstrap = clock();
 
   NCCLCHECKGOTO(ncclInit(), res, fail);
   if (myrank == 0) showVersion();
+  nccl_init = clock();
 
   // Make sure the CUDA runtime is initialized.
   CUDACHECKGOTO(cudaFree(NULL), res, fail);
@@ -1742,10 +1749,20 @@ static ncclResult_t ncclCommInitRankDev(ncclComm_t* newcomm, int nranks, ncclUni
   job->commId = commId; // C++ struct assignment
   job->myrank = myrank;
   job->cudaDev = cudaDev;
+  nccl_calloc = clock();
   NCCLCHECKGOTO(ncclAsyncLaunch(&job->base, ncclCommInitRankFunc, NULL, free, comm), res, fail);
+  nccl_async_launch = clock();
 
 exit:
-  return ncclGroupErrCheck(res);
+  ret = ncclGroupErrCheck(res);
+  done = clock();
+  fprintf(stdout, "ncclCommInitRankDev: bootstrap %f, nccl_init %f, nccl_calloc %f, nccl_async_launch %f, done %f\n",
+          (double)(bootstrap - start) / CLOCKS_PER_SEC,
+          (double)(nccl_init - bootstrap) / CLOCKS_PER_SEC,
+          (double)(nccl_calloc - nccl_init) / CLOCKS_PER_SEC,
+          (double)(nccl_async_launch - nccl_calloc) / CLOCKS_PER_SEC,
+          (double)(done - nccl_async_launch) / CLOCKS_PER_SEC);
+  return ret;
 fail:
   if (comm) {
     if (comm->abortFlag) ncclCudaHostFree((void *)comm->abortFlag);
@@ -1854,21 +1871,31 @@ ncclResult_t ncclCommSetAsyncError(ncclComm_t comm, ncclResult_t nextState) {
 
 NCCL_API(ncclResult_t, ncclCommInitRankConfig, ncclComm_t* comm, int nranks, ncclUniqueId commId, int myrank, ncclConfig_t *config);
 ncclResult_t ncclCommInitRankConfig(ncclComm_t *newcomm, int nranks, ncclUniqueId commId, int myrank, ncclConfig_t *config) {
+  clock_t start, group_start_internal, cuda_lib_init, ncclcomminit;
+  start = clock();
   NVTX3_FUNC_RANGE_IN(nccl_domain);
   int cudaDev;
   ncclResult_t ret = ncclSuccess;
   ncclConfig_t internalConfig = NCCL_CONFIG_INITIALIZER;
   ncclConfig_t *internalConfigPtr = NULL;
   NCCLCHECK(ncclGroupStartInternal());
+  group_start_internal = clock();
 
   (void)ncclCudaLibraryInit();
   CUDACHECKGOTO(cudaGetDevice(&cudaDev), ret, fail);
+  cuda_lib_init = clock();
 
+  fprintf(stdout, "ncclCommInitRankConfig: cudaDev=%d\n", cudaDev);
   if (config == NULL)
     internalConfigPtr = &internalConfig;
   else
     internalConfigPtr = config;
   NCCLCHECKGOTO(ncclCommInitRankDev(newcomm, nranks, commId, myrank, cudaDev, internalConfigPtr), ret, fail);
+  ncclcomminit = clock();
+  fprintf(stdout, "ncclCommInitRankConfig: group_start_internal=%f, cuda_lib_init=%f, ncclcomminit=%f\n",
+          (double)(group_start_internal - start) / CLOCKS_PER_SEC,
+          (double)(cuda_lib_init - group_start_internal) / CLOCKS_PER_SEC,
+          (double)(ncclcomminit - cuda_lib_init) / CLOCKS_PER_SEC);
 
 exit:
   ncclGroupErrCheck(ret);
